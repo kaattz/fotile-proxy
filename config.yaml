@@ -1,0 +1,30 @@
+slug: "fotile_proxy"
+name: "Fotile Proxy"
+version: "1.0.1" 
+description: "A proxy server to intercept and modify traffic for Fotile devices, enabling local MQTT control."
+author: "Your Name"
+icon: "mdi:swap-horizontal-bold"
+arch:
+  - "amd64"
+  - "aarch64"
+  - "armv7"
+
+options:
+  target_host: ""
+schema:
+  target_host: "str"
+
+ports:
+  "80/tcp": 80
+ports_description:
+  "80/tcp": "HTTP Proxy Port for Fotile devices"
+
+boot: "auto"
+log_level: "info"
+host_network: false
+apparmor: false
+privileged:
+  - "NET_BIND_SERVICE"
+
+hassio_api: true
+hassio_role: default
