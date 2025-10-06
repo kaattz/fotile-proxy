@@ -8,9 +8,17 @@ arch:
   - "armv7"
 
 options:
-  target_host: ""
+  target_host: "api.fotile.com"
+  mqtt_host: ""
+  target_scheme: "https" 
+  upstream_ip: "115.29.174.142" 
+  log_level: "INFO"
 schema:
   target_host: str
+  mqtt_host: str
+  target_scheme: str
+  upstream_ip: str
+  log_level: list(DEBUG|INFO|WARNING|ERROR)
 
 ports:
   "80/tcp": 80

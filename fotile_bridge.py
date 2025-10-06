@@ -3,13 +3,29 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 import socket
 import os
+import logging
+import sys
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("fotile-proxy")
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    # 从环境变量中读取 TARGET_HOST
-    # 如果环境变量不存在，使用默认地址
-    TARGET_HOST = os.environ.get("TARGET_HOST", "101.37.40.179")
-    MQTT_HOST = os.environ.get("SUPERVISOR_IP", "127.0.0.1")
-
+    TARGET_HOST = os.environ.get("TARGET_HOST", "api.fotile.com")
+    MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
+    TARGET_SCHEME = os.environ.get("TARGET_SCHEME", "https").lower()
+    UPSTREAM_IP   = os.environ.get("UPSTREAM_IP", "").strip()
+    TIMEOUT       = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
+    # 将 BaseHTTPRequestHandler 的默认访问日志重定向到我们的 logger
+    def log_message(self, fmt, *args):
+        logger.info("%s - " + fmt, self.address_string(), *args)
+    def build_target_url(self):
+        host = self.UPSTREAM_IP if self.UPSTREAM_IP else self.TARGET_HOST
+        return f"{self.TARGET_SCHEME}://{host}{self.path}"
     def standardize_header_name(self, name):
         standards = {
             'date': 'Date',
@@ -25,49 +41,40 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # 打印请求日志
     def log_request_details(self, method, path, headers, body):
-        print("=== HTTP Request Start ===")
-        print(f"{method} {path} HTTP/1.1")
+        logger.debug("=== HTTP Request Start ===")
+        logger.debug("%s %s HTTP/1.1", method, path)
         for key, value in headers.items():
-            print(f"{key}: {value}")
+            logger.debug("%s: %s", key, value)
         if body:
             try:
-                print("\nRequest Body:")
-                print(body.decode('utf-8'))
+                logger.debug("Request Body:\n%s", body.decode('utf-8'))
             except UnicodeDecodeError:
-                print("<非文本数据>")
-        print("=== HTTP Request End ===\n")
+                logger.warning("Request Body: <非文本数据>")
+        logger.debug("=== HTTP Request End ===")
 
     # 打印响应日志
     def log_response_details(self, status_code, headers, body):
-        print("=== HTTP Response Start ===")
-        print(f"HTTP/1.1 {status_code}")
+        logger.debug("=== HTTP Response Start ===")
+        logger.debug("HTTP/1.1 %s", status_code)
         for key, value in headers.items():
-            print(f"{key}: {value}")
+            logger.debug("%s: %s", key, value)
         if body:
             try:
-                # 尝试格式化 JSON 输出
                 data = json.loads(body.decode('utf-8'))
-                print("\nResponse Body (JSON):")
-                print(json.dumps(data, indent=2, ensure_ascii=False))
+                logger.debug("Response Body (JSON):\n%s", json.dumps(data, indent=2, ensure_ascii=False))
             except (UnicodeDecodeError, json.JSONDecodeError):
-                print("\nResponse Body (Raw):")
-                print(body.decode('utf-8', errors='replace'))
-        print("=== HTTP Response End ===\n")
+                logger.warning("Response Body (Raw):\n%s", body.decode('utf-8', errors='replace'))
+        logger.debug("=== HTTP Response End ===")
 
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
 
         headers = {'Connection': 'close'}
-        # 在准备将请求转发给真正的方太服务器
-        # 其中 headers[key] = 'api.fotile.com' 至关重要。
-        # 因为油烟机发出的请求的 Host 头是 api.fotile.com，
-        # 但我们的代理服务器在转发时，httpx 库可能会自动将其改为目标 IP 地址。
-        # 这里我们强制将 Host 头改回官方域名，
-        # 确保方太的服务器能正确识别这个请求，认为它是一个合法的、来自正常客户端的请求。
+        # 将 Host 头改回官方域名，确保方太的服务器能正确识别这个请求。
         for key, value in self.headers.items():
             if key.lower() == 'host':
-                headers[key] = 'api.fotile.com'
+                headers[key] = self.TARGET_HOST
             else:
                 headers[key] = value
         for key in list(headers.keys()):
@@ -75,37 +82,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 del headers[key]
 
         # 打印请求日志
+        logger.info("Client IP: %s", self.client_address[0])
         self.log_request_details("POST", self.path, headers, post_data)
 
         # 将请求转发给真正的方太服务器
-        target_url = f"http://{self.TARGET_HOST}{self.path}"
-        with httpx.Client(headers={}) as client:
+        target_url = self.build_target_url()
+        verify_tls = not (self.TARGET_SCHEME == "https" and (self.UPSTREAM_IP or self.TARGET_HOST.replace('.', '').isdigit()))
+        with httpx.Client(timeout=self.TIMEOUT, verify=verify_tls, headers={}) as client:
             try:
                 request = client.build_request('POST', target_url, content=post_data, headers=headers)
-
                 unwanted_headers = ['user-agent', 'accept', 'accept-encoding']
                 for key in unwanted_headers:
                     request.headers.pop(key, None)
 
                 response = client.send(request, follow_redirects=False)
 
-                # 核心拦截与篡改逻辑
-                # 代码在这里设置了一个条件检查：
-                # 如果请求的路径恰好是 /iot-mqttManager/routeService（抓包发现的，专门用来获取 MQTT 服务器信息的），
-                # 那么就不直接返回原始响应。
-                # 而是调用 self.modify_response() 函数对响应内容进行**“手术”**。
+                # 如果请求的路径恰好是 /iot-mqttManager/routeService，调用 self.modify_response() 函数对响应内容进行IP地址内容改写。
                 # 如果请求的是任何其他路径，就直接使用 response.content，即原样转发。
                 if self.path == "/iot-mqttManager/routeService":
                     content_to_send = self.modify_response(response.content)
                 else:
                     content_to_send = response.content
 
-                # 打印响应日志
-                self.log_response_details(response.status_code, response.headers, content_to_send)
-
-                # 这部分代码负责将处理过的响应（可能是原始的，也可能是被篡改过的）按照标准的 HTTP 格式，发送回最初发起请求的油烟机。
-                # 油烟机收到这个响应后，它会完全相信这就是来自 api.fotile.com 官方的回复。
-                # 当它解析 /iot-mqttManager/routeService 的响应时，就会拿到我们伪造的本地 MQTT 服务器 IP，并尝试与之建立连接。
+                # 发送回最初发起请求的油烟机。
                 self.send_response(response.status_code)
 
                 unwanted_response_headers = ['transfer-encoding', 'server', 'content-length']
@@ -117,32 +116,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(content_to_send)
 
+                self.log_response_details(response.status_code, response.headers, content_to_send)
+            except httpx.ConnectTimeout:
+                logger.exception("Proxy error: connect timeout -> %s", target_url)
+                self.send_error(500, "Proxy error: timed out")
             except Exception as e:
-                self.send_error(500, f"Proxy error: {str(e)}")
+                logger.exception("Proxy error: %s", e)
+                self.send_error(500, f"Proxy error: {e}")
 
-
-    # 这个函数接收来自方太服务器的原始响应体 content。
-    # 它尝试将响应体解析为 JSON 格式。
-    # 然后检查 JSON 数据结构，如果发现其中包含了 "ip" 这个键（这表明响应里有服务器 IP 地址），
-    # 就毫不犹豫地将它的值修改为我们自己局域网内 MQTT 服务器的 IP 地址 (192.168.1.194)。
-    # 最后，将修改后的 JSON 数据重新编码并返回。
-    # 如果解析失败或结构不匹配，就返回原始内容，确保程序的健壮性。
-
+    # 检查 JSON 数据结构，包含了 "ip" 这个键，改为局域网内MQTT服务器的IP地址。
     def modify_response(self, content):
         try:
             data = json.loads(content.decode('utf-8'))
             if isinstance(data, list) and len(data) > 0 and "ip" in data[0]:
-                print(f"Modifying MQTT IP from '{data[0]['ip']}' to '{self.MQTT_HOST}'")
-                data[0]["ip"] = self.MQTT_HOST
+                old_ip = data[0]['ip']
+                if old_ip != self.MQTT_HOST:
+                    logger.info("Modifying MQTT IP from '%s' to '%s'", old_ip, self.MQTT_HOST)
+                    data[0]["ip"] = self.MQTT_HOST
             return json.dumps(data).encode('utf-8')
-        except (json.JSONDecodeError, KeyError, IndexError):
+        except (json.JSONDecodeError, KeyError, IndexError, UnicodeDecodeError):
             return content
 
 def run_server():
     server_address = ('', 80)
     httpd = HTTPServer(server_address, ProxyHandler)
     httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
-    print("代理服务器已在端口80启动...")
+    logger.info("代理服务器已在端口80启动...")
     httpd.serve_forever()
 
 if __name__ == '__main__':
